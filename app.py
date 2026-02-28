@@ -1,166 +1,255 @@
-# Standard Library Imports
-import logging
 import os
+import re
+import time
+from getpass import getpass
 
-# Third-party Imports
-from dotenv import load_dotenv
-import chromadb
-import gradio as gr
-from huggingface_hub import snapshot_download
+import torch
+import PyPDF2
+import gradio
 
-# LlamaIndex (Formerly GPT Index) Imports
-from llama_index.core import VectorStoreIndex
-from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core.llms import MessageRole
-from llama_index.core.memory import ChatSummaryMemoryBuffer
-from llama_index.core.tools import RetrieverTool, ToolMetadata
-from llama_index.agent.openai import OpenAIAgent
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
-from llama_index.core import Settings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+from langchain_core.caches import InMemoryCache
+from langchain_core.globals import set_llm_cache
+from langchain_chroma import Chroma
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 
-load_dotenv()
+# =========================
+# 0) Auth + Cache
+# =========================
+hfapi_key = getpass("Enter your HuggingFace access token: ").strip()
+if hfapi_key:
+    os.environ["HF_TOKEN"] = hfapi_key
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = hfapi_key
+    print("HF token set.")
+else:
+    print("HF token not set (public models only).")
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+set_llm_cache(InMemoryCache())
 
-PROMPT_SYSTEM_MESSAGE = """You are an AI teacher, answering questions from students of an applied AI course on Large Language Models (LLMs or llm) and Retrieval Augmented Generation (RAG) for LLMs. 
-Topics covered include training models, fine-tuning models, giving memory to LLMs, prompting tips, hallucinations and bias, vector databases, transformer architectures, embeddings, RAG frameworks such as 
-Langchain and LlamaIndex, making LLMs interact with tools, AI agents, reinforcement learning with human feedback (RLHF). Questions should be understood in this context. Your answers are aimed to teach 
-students, so they should be complete, clear, and easy to understand. Use the available tools to gather insights pertinent to the field of AI.
-To find relevant information for answering student questions, always use the "AI_Information_related_resources" tool.
+# =========================
+# 1) Global config
+# =========================
+persist_directory = "docs/chroma/"
+pdf_path = "InnoVait_TCM1.pdf"   # 改成你的 PDF 路徑
 
-Only some information returned by the tool might be relevant to the question, so ignore the irrelevant part and answer the question with what you have. Your responses are exclusively based on the output provided 
-by the tools. Refrain from incorporating information not directly obtained from the tool's responses.
-If a user requests further elaboration on a specific aspect of a previously discussed topic, you should reformulate your input to the tool to capture this new angle or more profound layer of inquiry. Provide 
-comprehensive answers, ideally structured in multiple paragraphs, drawing from the tool's variety of relevant details. The depth and breadth of your responses should align with the scope and specificity of the information retrieved. 
-Should the tool response lack information on the queried topic, politely inform the user that the question transcends the bounds of your current knowledge base, citing the absence of relevant content in the tool's documentation. 
-At the end of your answers, always invite the students to ask deeper questions about the topic if they have any.
-Do not refer to the documentation directly, but use the information provided within it to answer questions. If code is provided in the information, share it with the students. It's important to provide complete code blocks so 
-they can execute the code when they copy and paste them. Make sure to format your answers in Markdown format, including code blocks and snippets.
-"""
+# =========================
+# 2) Read PDF
+# =========================
+def get_documents() -> str:
+    print("$$$$$ ENTER INTO get_documents $$$$$")
+    parts = []
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            parts.append(text)
+    full_text = "\n".join(parts)
+    print("Chars:", len(full_text))
+    print("@@@@@@ EXIT FROM get_documents @@@@@")
+    return full_text
 
-TEXT_QA_TEMPLATE = """
-You must answer only related to AI, ML, Deep Learning and related concepts queries.
-Always leverage the retrieved documents to answer the questions, don't answer them on your own.
-If the query is not relevant to AI, say that you don't know the answer.
-"""
+# =========================
+# 3) Split text
+# =========================
+def getTextSplits():
+    print("$$$$$ ENTER INTO getTextSplits $$$$$")
+    splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=128)
+    texts = splitter.split_text(get_documents())
+    print("Num chunks:", len(texts))
+    print("@@@@@@ EXIT FROM getTextSplits @@@@@")
+    return texts
 
+# =========================
+# 4) Embeddings
+# =========================
+def getEmbeddings():
+    print("$$$$$ ENTER INTO getEmbeddings $$$$$")
+    modelPath = "mixedbread-ai/mxbai-embed-large-v1"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def download_knowledge_base_if_not_exists():
-    """Download the knowledge base from the Hugging Face Hub if it doesn't exist locally"""
-    if not os.path.exists("data/ai_tutor_knowledge"):
-        os.makedirs("data/ai_tutor_knowledge")
-
-        logging.warning(
-            f"Vector database does not exist at 'data/', downloading from Hugging Face Hub..."
-        )
-        snapshot_download(
-            repo_id="jaiganesan/ai_tutor_knowledge_vector_Store",
-            local_dir="data/ai_tutor_knowledge",
-            repo_type="dataset",
-        )
-        logging.info(f"Downloaded vector database to 'data/ai_tutor_knowledge'")
-
-
-def get_tools(db_collection="ai_tutor_knowledge"):
-    db = chromadb.PersistentClient(path=f"data/{db_collection}")
-    chroma_collection = db.get_or_create_collection(db_collection)
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-
-    index = VectorStoreIndex.from_vector_store(
-        vector_store=vector_store,
-        show_progress=True,
-        use_async=True,
-        embed_model=Settings.embed_model
+    embedding = HuggingFaceEmbeddings(
+        model_name=modelPath,
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": False},
     )
-    vector_retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=15,
-        embed_model=Settings.embed_model,
-        use_async=True,
+    print("@@@@@@ EXIT FROM getEmbeddings @@@@@")
+    return embedding
+
+# =========================
+# 5) LLM (HF Inference)
+# =========================
+def getLLM():
+    print("$$$$$ ENTER INTO getLLM $$$$$")
+    llm = HuggingFaceEndpoint(
+        repo_id="HuggingFaceH4/zephyr-7b-beta",
+        task="text-generation",
+        max_new_tokens=512,
+        do_sample=True,
+        temperature=0.2,          # RAG 建議低一點，減少幻覺
+        repetition_penalty=1.1,
+        top_k=10,
     )
-    tools = [
-        RetrieverTool(
-            retriever=vector_retriever,
-            metadata=ToolMetadata(
-                name="AI_Information_related_resources",
-                description="Useful for info related to artificial intelligence, ML, deep learning. It gathers the info from local data.",
-            ),
+    print("@@@@@@ EXIT FROM getLLM @@@@@")
+    return llm
+
+# =========================
+# 6) Chroma utils
+# =========================
+def is_chroma_db_present(directory: str):
+    return os.path.exists(directory) and len(os.listdir(directory)) > 0
+
+# =========================
+# 7) Query classification (routing)
+# =========================
+def classify_query(query: str):
+    q = query.lower()
+    concept_patterns = [r"what is", r"define", r"explain", r"describe", r"concept of"]
+    example_patterns = [r"give an example", r"demonstrate", r"illustrate"]
+    code_patterns = [r"how to implement", r"python code", r"write a program"]
+
+    for p in concept_patterns:
+        if re.search(p, q):
+            return "concept"
+    for p in example_patterns:
+        if re.search(p, q):
+            return "example"
+    for p in code_patterns:
+        if re.search(p, q):
+            return "code"
+    return "general"
+
+# =========================
+# 8) Retriever (MMR / similarity)
+# =========================
+def getRetriever(query, metadata_filter=None):
+    print("$$$$$ ENTER INTO getRetriever $$$$$")
+
+    query_type = classify_query(query)
+    print("Query type:", query_type)
+
+    k_default = 2
+    fetch_k_default = 5
+    search_type_default = "mmr"
+
+    if query_type == "concept":
+        k_default = 5
+        fetch_k_default = 10
+        search_type_default = "mmr"
+    elif query_type in ["example", "code"]:
+        search_type_default = "similarity"
+
+    # Load or build DB
+    if is_chroma_db_present(persist_directory):
+        print("Loading existing Chroma DB...")
+        vectordb = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=getEmbeddings(),
+            collection_name="ai_tutor",
         )
-    ]
-    return tools
+    else:
+        print("Building new Chroma DB from PDF...")
+        vectordb = Chroma.from_texts(
+            texts=getTextSplits(),
+            embedding=getEmbeddings(),
+            persist_directory=persist_directory,
+            collection_name="ai_tutor",
+        )
 
-
-def generate_completion(query, history, memory):
-    logging.info(f"User query: {query}")
-
-    # Manage memory
-    chat_list = memory.get()
-    if len(chat_list) != 0:
-        user_index = [i for i, msg in enumerate(chat_list) if msg.role == MessageRole.USER]
-        if len(user_index) > len(history):
-            user_index_to_remove = user_index[len(history)]
-            chat_list = chat_list[:user_index_to_remove]
-            memory.set(chat_list)
-    logging.info(f"chat_history: {len(memory.get())} {memory.get()}")
-    logging.info(f"gradio_history: {len(history)} {history}")
-
-    # Create agent
-    tools = get_tools(db_collection="ai_tutor_knowledge")
-    agent = OpenAIAgent.from_tools(
-        llm=Settings.llm,
-        memory=memory,
-        tools=tools,
-        system_prompt=PROMPT_SYSTEM_MESSAGE,
-    )
-
-    # Generate answer
-    completion = agent.stream_chat(query)
-    answer_str = ""
-    for token in completion.response_gen:
-        answer_str += token
-        yield answer_str
-
-
-def launch_ui():
-    with gr.Blocks(
-        fill_height=True,
-        title="AI Tutor 🤖",
-        analytics_enabled=True,
-    ) as demo:
-
-        memory_state = gr.State(
-            lambda: ChatSummaryMemoryBuffer.from_defaults(
-                token_limit=120000,
+    # (Optional) metadata filter — 這裡保留接口，但若你沒存 metadata，請留空
+    if metadata_filter:
+        metadata_filter_dict = {"result": metadata_filter}
+        if search_type_default == "similarity":
+            return vectordb.as_retriever(
+                search_type=search_type_default,
+                search_kwargs={"k": k_default, "filter": metadata_filter_dict},
             )
-        )
-        chatbot = gr.Chatbot(
-            scale=1,
-            placeholder="<strong>AI Tutor 🤖: A Question-Answering Bot for anything AI-related</strong><br>",
-            show_label=False,
-            show_copy_button=True,
+        return vectordb.as_retriever(
+            search_type=search_type_default,
+            search_kwargs={"k": k_default, "fetch_k": fetch_k_default, "filter": metadata_filter_dict},
         )
 
-        gr.ChatInterface(
-            fn=generate_completion,
-            chatbot=chatbot,
-            additional_inputs=[memory_state],
-        )
+    if search_type_default == "similarity":
+        return vectordb.as_retriever(search_type=search_type_default, search_kwargs={"k": k_default})
 
-        demo.queue(default_concurrency_limit=64)
-        demo.launch(debug=True, share=False) # Set share=True to share the app online
+    return vectordb.as_retriever(
+        search_type=search_type_default, search_kwargs={"k": k_default, "fetch_k": fetch_k_default}
+    )
 
+# =========================
+# 9) RAG pipeline (streaming)
+# =========================
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
 
-if __name__ == "__main__":
-    # Download the knowledge base if it doesn't exist
-    download_knowledge_base_if_not_exists()
+def get_rag_response(query, metadata_filter=None):
+    print("$$$$$ ENTER INTO get_rag_response $$$$$")
 
-    # Set up llm and embedding model
-    Settings.llm = OpenAI(temperature=0, model="gpt-4o-mini")
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    retriever = getRetriever(query, metadata_filter)
+    llm = getLLM()
 
-    # launch the UI
-    launch_ui()
+    template = """Use the following pieces of context to answer the question.
+If you don't know the answer, just say that you don't know. Do not make up an answer.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Helpful Answer:
+"""
+    prompt = PromptTemplate.from_template(template)
+
+    def prepare_inputs(inputs):
+        docs = retriever.invoke(inputs["question"])
+        context = format_docs(docs)
+        return {"context": context, "question": inputs["question"]}
+
+    rag_chain = (
+        RunnablePassthrough()
+        | RunnableLambda(prepare_inputs)
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    full_response = ""
+    for chunk in rag_chain.stream({"question": query}):
+        full_response += chunk
+        time.sleep(0.03)
+        yield full_response
+
+# =========================
+# 10) Gradio UI
+# =========================
+in_question = gradio.Textbox(
+    lines=6,
+    label="Ask a question",
+    value="What are Artificial Intelligence and Machine Learning?",
+)
+
+in_metadata_filter = gradio.Textbox(
+    lines=1,
+    label="(Optional) Metadata filter",
+)
+
+out_response = gradio.Textbox(
+    label="Response",
+    interactive=False,
+    show_copy_button=True,
+)
+
+iface = gradio.Interface(
+    fn=get_rag_response,
+    inputs=[in_question, in_metadata_filter],
+    outputs=out_response,
+    title="Your AI Tutor (RAG)",
+    description="Ask questions about the PDF using Retrieval-Augmented Generation.",
+    allow_flagging="never",
+    stream_every=0.5,
+)
+
+iface.launch(share=True)
