@@ -8,13 +8,14 @@ import PyPDF2
 import gradio
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+from langchain_huggingface import (
+    HuggingFaceEmbeddings,
+    HuggingFaceEndpoint,
+    ChatHuggingFace,
+)
 from langchain_core.caches import InMemoryCache
 from langchain_core.globals import set_llm_cache
 from langchain_chroma import Chroma
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 
 # =========================
 # 0) Auth + Cache
@@ -33,7 +34,7 @@ set_llm_cache(InMemoryCache())
 # 1) Global config
 # =========================
 persist_directory = "docs/chroma/"
-pdf_path = "InnoVait_TCM1.pdf"   # 改成你的 PDF 路徑
+pdf_path = "InnoVait_TCM1.pdf"  # 改成你的 PDF 路徑
 
 # =========================
 # 2) Read PDF
@@ -79,21 +80,24 @@ def getEmbeddings():
     return embedding
 
 # =========================
-# 5) LLM (HF Inference)
+# 5) LLM (HF Inference) - conversational/chat
 # =========================
 def getLLM():
     print("$$$$$ ENTER INTO getLLM $$$$$")
-    llm = HuggingFaceEndpoint(
+
+    # 使用 HF router/provider；此模型在 featherless-ai 上只支援 conversational
+    endpoint = HuggingFaceEndpoint(
         repo_id="HuggingFaceH4/zephyr-7b-beta",
-        task="text-generation",
         max_new_tokens=512,
-        do_sample=True,
-        temperature=0.2,          # RAG 建議低一點，減少幻覺
+        temperature=0.2,
         repetition_penalty=1.1,
         top_k=10,
+        provider="auto",
     )
+
+    chat_model = ChatHuggingFace(llm=endpoint)
     print("@@@@@@ EXIT FROM getLLM @@@@@")
-    return llm
+    return chat_model
 
 # =========================
 # 6) Chroma utils
@@ -158,7 +162,7 @@ def getRetriever(query, metadata_filter=None):
             collection_name="ai_tutor",
         )
 
-    # (Optional) metadata filter — 這裡保留接口，但若你沒存 metadata，請留空
+    # (Optional) metadata filter — 若你沒存 metadata，請留空
     if metadata_filter:
         metadata_filter_dict = {"result": metadata_filter}
         if search_type_default == "similarity":
@@ -175,11 +179,12 @@ def getRetriever(query, metadata_filter=None):
         return vectordb.as_retriever(search_type=search_type_default, search_kwargs={"k": k_default})
 
     return vectordb.as_retriever(
-        search_type=search_type_default, search_kwargs={"k": k_default, "fetch_k": fetch_k_default}
+        search_type=search_type_default,
+        search_kwargs={"k": k_default, "fetch_k": fetch_k_default},
     )
 
 # =========================
-# 9) RAG pipeline (streaming)
+# 9) RAG pipeline (streaming) - CHAT
 # =========================
 def format_docs(docs):
     return "\n\n".join(d.page_content for d in docs)
@@ -187,38 +192,30 @@ def format_docs(docs):
 def get_rag_response(query, metadata_filter=None):
     print("$$$$$ ENTER INTO get_rag_response $$$$$")
 
+    # 先 yield 一次，避免前端以為卡死（第一次建庫/載模型會很久）
+    yield "Working on it...\n"
+
     retriever = getRetriever(query, metadata_filter)
-    llm = getLLM()
+    chat_model = getLLM()
 
-    template = """Use the following pieces of context to answer the question.
-If you don't know the answer, just say that you don't know. Do not make up an answer.
+    docs = retriever.invoke(query)
+    context = format_docs(docs)
 
-Context:
-{context}
-
-Question:
-{question}
-
-Helpful Answer:
-"""
-    prompt = PromptTemplate.from_template(template)
-
-    def prepare_inputs(inputs):
-        docs = retriever.invoke(inputs["question"])
-        context = format_docs(docs)
-        return {"context": context, "question": inputs["question"]}
-
-    rag_chain = (
-        RunnablePassthrough()
-        | RunnableLambda(prepare_inputs)
-        | prompt
-        | llm
-        | StrOutputParser()
+    system_msg = (
+        "Use the following pieces of context to answer the question.\n"
+        "If you don't know the answer, just say that you don't know. Do not make up an answer.\n\n"
+        f"Context:\n{context}\n"
     )
 
+    messages = [
+        ("system", system_msg),
+        ("human", query),
+    ]
+
     full_response = ""
-    for chunk in rag_chain.stream({"question": query}):
-        full_response += chunk
+    for chunk in chat_model.stream(messages):
+        text = getattr(chunk, "content", str(chunk))
+        full_response += text
         time.sleep(0.03)
         yield full_response
 
@@ -233,7 +230,8 @@ in_question = gradio.Textbox(
 
 in_metadata_filter = gradio.Textbox(
     lines=1,
-    label="(Optional) Metadata filter",
+    label="(Optional) Metadata filter (leave blank if unused)",
+    value="",
 )
 
 out_response = gradio.Textbox(
@@ -249,7 +247,6 @@ iface = gradio.Interface(
     title="Your AI Tutor (RAG)",
     description="Ask questions about the PDF using Retrieval-Augmented Generation.",
     allow_flagging="never",
-    stream_every=0.5,
 )
 
-iface.launch(share=True)
+iface.launch(share=False, show_error=True)

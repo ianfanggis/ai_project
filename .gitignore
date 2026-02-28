@@ -1,5 +1,8 @@
-.DS_Store
+venv/
+.venv/
+__pycache__/
+data/
+*.pt
+*.bin
+*.safetensors
 .env
-data/*
-~data/.gitkeep
-venv
